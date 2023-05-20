@@ -1,0 +1,42 @@
+
+data {
+C <- 10000 # JAGS does not warn if too small!
+for (i in 1:NMatches) {
+ones[i] <- 1
+  }
+}
+
+model{
+#custom pdf of scores based on treating games as independent bernoulli dists
+for (matchIdx in 1:NMatches) {
+  spy[matchIdx] <- (
+  exp(
+  logfact(totSets[matchIdx])
+  - logfact(WSets[matchIdx])
+  - logfact(LSets[matchIdx])
+    )
+  *pow(theta[matchIdx],WSets[matchIdx])*pow(1-theta[matchIdx],LSets[matchIdx])
+  )
+  
+  ones[matchIdx] ~ dbern( spy[matchIdx] )
+  
+}
+
+for (matchIdx in 1:NMatches) {
+  theta[matchIdx] ~ dbeta(rating[WSubj[matchIdx]], 
+                          rating[LSubj[matchIdx]]) T(0.001,0.999)
+}
+
+
+for(subjIdx in 1:NSubj){
+  rating[subjIdx] ~ dgamma(thetaG,kappaG)
+}
+
+
+thetaG <- (sigma0 **2) / mu0
+kappaG <- mu0 / sigma0
+
+mu0 ~ dnorm(5,1)
+sigma0 ~ dgamma(2,2)
+}
+

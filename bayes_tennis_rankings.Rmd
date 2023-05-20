@@ -1,0 +1,261 @@
+---
+title: "bayes_tennis_rankings"
+author: "Jack_Feds"
+date: "2023-05-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+sourceStr <- paste(dirname(getwd()),
+                   "/Bayes Analysis/DBDA2Eprograms/DBDA2E-utilities.R",
+                   sep="")
+
+sourceStr2 <- paste(dirname(getwd()),
+                    "/Bayes Analysis/DBDA2Eprograms/Jags-Ybinom-XnomSsubjCcat-MbinomBetaOmegaKappa.R",
+                    sep="")
+source(sourceStr)
+source(sourceStr2) # no longer source utilities in scripts from text book
+require(rjags)
+require(tidyverse)
+```
+
+```{r}
+# Loading CSVs into data frame
+colnames <- colnames(read.csv("csv_files/wimbledon_2010.csv"))[1:30]
+df <- as.data.frame(matrix(nrow=0,ncol=length(colnames)))
+colnames(df) <- colnames
+
+for(csvIdx in dir("csv_files")){
+  path <- paste(getwd(), "/csv_files/", csvIdx,sep="")
+  temp <- read.csv(path,stringsAsFactors = TRUE)[,1:30]
+  df <- rbind(df,temp)
+}
+
+#cleaning NAs from odds column. 
+df <- df %>%
+  filter(!is.na(B365W) & !is.na(B365L)) %>% 
+  filter(!is.na(Wsets) & !is.na(Lsets)) %>% 
+  mutate(WinnerId = match(Winner,unique(c(df$Winner,df$Loser)))) %>%
+  mutate(LoserId = match(Loser,unique(c(df$Winner,df$Loser))))
+```
+
+```{r}
+#Exploring distrubition of betting odds
+summary(df$B365W)
+summary(df$B365L)
+par(mfrow=c(1,2))
+hist(df$B365W,freq = TRUE,xlim = c(0,10),breaks=100)
+hist(df$B365L,freq = TRUE,xlim = c(0,20),breaks=100)
+```
+
+from the above histogram the highest realistic odds are about 8:1 or 9:1.
+so the lowest ranked player compared to the greatest ranked player should
+produce a chance of winning of about 1/9. 
+
+We want players rankings to be normally distributed between 1 and 9. the corresponds roughly to a normal distribution with mean 5 and variance 1.6.
+We'll use the gamma distribution to approximate the normal distribution and cut off negative ratings. 
+
+```{r}
+#loading df into datalist for jags
+WSets = df$Wsets
+LSets = df$Lsets
+totSets = df$Wsets + df$Lsets
+NMatches = length(df$Wsets)
+WSubj = df$WinnerId
+LSubj = df$LoserId
+NSubj = length(unique(c(df$Winner,df$Loser)))
+
+dataList <- list(
+  WSets = WSets,
+  LSets = LSets,
+  totSets = totSets,
+  NMatches = NMatches,
+  LSubj = LSubj,
+  WSubj = WSubj,
+  NSubj = NSubj
+)
+```
+
+```{r}
+#Customs distribution for best of 5 matches
+#Defining the model
+modelString <- "
+data {
+C <- 10000 # JAGS does not warn if too small!
+for (i in 1:NMatches) {
+ones[i] <- 1
+  }
+}
+
+model{
+#custom pdf of scores based on treating games as independent bernoulli dists
+for (matchIdx in 1:NMatches) {
+  spy[matchIdx] <- (
+  exp(
+  logfact(totSets[matchIdx])
+  - logfact(WSets[matchIdx])
+  - logfact(LSets[matchIdx])
+    )
+  *pow(theta[matchIdx],WSets[matchIdx])*pow(1-theta[matchIdx],LSets[matchIdx])
+  )
+  
+  ones[matchIdx] ~ dbern( spy[matchIdx] )
+  
+}
+
+for (matchIdx in 1:NMatches) {
+  theta[matchIdx] ~ dbeta(rating[WSubj[matchIdx]], 
+                          rating[LSubj[matchIdx]]) T(0.001,0.999)
+}
+
+
+for(subjIdx in 1:NSubj){
+  rating[subjIdx] ~ dgamma(thetaG,kappaG)
+}
+
+
+thetaG <- (sigma0 **2) / mu0
+kappaG <- mu0 / sigma0
+
+mu0 ~ dnorm(5,1)
+sigma0 ~ dgamma(2,2)
+}
+"
+writeLines( modelString , con="rankModel.txt" )
+```
+
+```{r}
+#Determining initial parameter values
+
+thetaInit = rep(0.5,NMatches) # every game has even odds
+
+ratingInit = rep(5,NSubj) # every player has same rating
+
+thetaG = 0.5
+kappaG = 3.33
+
+mu0Init = 5
+sigma0Init = 1.5
+
+initList = list(
+  theta = thetaInit,
+  rating = ratingInit,
+  # thetaG = thetaG,
+  # kappaG = kappaG,
+  mu0 = mu0Init,
+  sigma0 = sigma0Init
+)
+```
+
+```{r}
+#Running the chains
+parameters = c("theta","rating","mu0","sigma0") # "thetaG","kappaG"
+adaptSteps = 500
+burnInSteps = 500
+nChains = 3
+
+jagsModel = jags.model(
+  file = "rankModel.txt",
+  data = dataList,
+  inits = initList,
+  n.chains = nChains,
+  n.adapt = adaptSteps
+  )
+
+update(jagsModel, n.iter=burnInSteps)
+```
+
+```{r}
+codaSamples <- coda.samples(jagsModel,variable.names=parameters,n.iter=3333,thin=1)
+```
+
+```{r}
+mcmcMat <- as.matrix(codaSamples)
+hist(mcmcMat[,"rating[61]"],freq=FALSE,breaks = 100)
+```
+
+```{r}
+players = list(unique(c(df$Winner,df$Loser)))
+
+rank_df = data.frame(player = players)
+colnames(rank_df) <- c("player")
+
+#join player id
+rank_df <- rank_df %>% 
+  left_join(
+      rename(select(df,Winner,WinnerId),player=Winner,id=WinnerId),
+    by="player") %>%
+  distinct() %>%
+  left_join(
+    rename(select(df,Loser,LoserId),player=Loser,id=LoserId),
+  by="player") %>% 
+  distinct() %>%
+  mutate(id=coalesce(id.x,id.y)) %>%
+  select(player, id) %>%
+  arrange(id)
+
+player_mode <- function(playerid = c(1,2,3,4,5)){
+  mode_list <- as.vector(rep(NA,length(playerid)))
+  for(id in playerid){
+    h <- hist(mcmcMat[,paste("rating[",as.character(id),"]",sep="")],plot=FALSE)
+    pMode <- min(h$mids[h$counts == max(h$counts)])
+    mode_list[id] <- pMode
+  }
+  return(mode_list)
+}
+
+player_mean <- function(playerid = c(1,2,3,4,5)){
+  mean_list <- as.vector(rep(NA,length(playerid)))
+  for(id in playerid){
+    pMean <- mean(mcmcMat[,paste("rating[",as.character(id),"]",sep="")])
+    mean_list[id] <- pMean
+  }
+  return(mean_list)
+}
+rank_df$mode <- player_mode(rank_df$id)
+rank_df$mean <- player_mean(rank_df$id)
+rank_df <- rank_df %>% 
+  arrange(desc(mode),desc(mean))
+
+rank_df
+```
+```{r}
+#plotting histograms of top n players by rankings
+n = 10
+openGraph(width=7,height=2.5*((n %/% 3))+1)
+par(mfrow=c((n %/% 3)+1,3))
+for(index in 1:n){
+  player_id <- rank_df[index,"id"]
+  plotPost(mcmcMat[,paste("rating[",as.character(player_id),"]",sep="")],
+           xlab = "rating",
+           xlim=c(0,20),
+           main = rank_df$player[index])
+}
+saveGraph(file="top_tennis_players_ratings",type="jpeg")
+```
+
+```{r}
+#plotting probability that player1 beats player2 in 1 set
+player1 <- "Rune H."
+player2 <- "Ruud C."
+
+id1 <- rank_df[which(rank_df$player==player1),"id"]
+id2 <- rank_df[which(rank_df$player==player2),"id"]
+
+rating1 <- mcmcMat[,paste("rating[",id1,"]",sep="")]
+rating2 <- mcmcMat[,paste("rating[",id2,"]",sep="")]
+
+openGraph(width=7,height=5)
+plotPost(rating1 / (rating1 + rating2),xlim=c(0,1))
+
+
+saveGraph(file=paste("win probability of ",
+                     player1,
+                     " over ",
+                     player2,
+                     sep=""),
+          type="jpeg")
+```
+
+
